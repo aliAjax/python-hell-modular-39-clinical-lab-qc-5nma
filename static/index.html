@@ -14,13 +14,17 @@
 <body>
 <main>
   <h1>临床实验室质量控制与结果拦截</h1>
-  <p>质控规则、仪器校准、失控调查和患者结果批次通过JSON接口管理。</p>
+  <p>质控批次到货记总瓶数，按分装单拆成工作瓶（瓶号/开瓶日期/失效时刻），仪器×项目在用容量超限即排队；工作瓶过期后在途质控退回重做，已放行批次保留原依据。</p>
   <p><button onclick="checkHealth()">检查服务状态</button></p>
   <pre id="result">等待操作</pre>
   <pre>GET  /health
-GET  /api/&lt;kind&gt;
+GET  /api/&lt;kind&gt;?status=&amp;qc_lot_id=...
 POST /api/&lt;kind&gt;
 POST /api/entities/&lt;id&gt;/actions
+POST /api/qc_lots/&lt;id&gt;/dispense
+POST /api/bottle_requests
+POST /api/working_bottles/&lt;id&gt;/{claim,consume,expire}
+POST /api/expired_bottles/sweep
 GET  /api/audit</pre>
 </main>
 <script>

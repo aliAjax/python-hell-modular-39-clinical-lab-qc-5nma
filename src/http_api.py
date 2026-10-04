@@ -92,8 +92,9 @@ def create_handler(service, rules, static_dir):
                     if len(parts) == 3:
                         return self._send(200, service.get(parts[2]))
                     query = parse_qs(parsed.query)
-                    status = query.get("status", [None])[0]
-                    return self._send(200, {"items": service.list(parts[1], status=status)})
+                    status = query.pop("status", [None])[0]
+                    filters = {key: values[0] for key, values in query.items() if values}
+                    return self._send(200, {"items": service.list(parts[1], status=status, filters=filters)})
                 raise NotFoundError("not found")
             except Exception as exc:
                 self._fail(exc)
@@ -103,6 +104,59 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if len(parts) == 4 and parts[:2] == ["api", "qc_lots"] and parts[3] == "dispense":
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.dispense_lot(
+                            actor,
+                            parts[2],
+                            body.get("dispense_order_no"),
+                            body.get("bottles", []),
+                        ),
+                    )
+                if len(parts) == 4 and parts[:2] == ["api", "working_bottles"]:
+                    bottle_id, verb = parts[2], parts[3]
+                    body = self._body()
+                    if verb == "claim":
+                        return self._send(
+                            200,
+                            service.claim_bottle(
+                                actor,
+                                bottle_id,
+                                body.get("instrument_id"),
+                                body.get("claim_no"),
+                            ),
+                        )
+                    if verb == "consume":
+                        return self._send(
+                            200,
+                            service.consume_bottle(actor, bottle_id, reason=body.get("reason", "")),
+                        )
+                    if verb == "expire":
+                        return self._send(
+                            200,
+                            service.expire_bottle(
+                                actor,
+                                bottle_id,
+                                reason=body.get("reason", "expired"),
+                                as_of=body.get("as_of"),
+                            ),
+                        )
+                if parts == ["api", "bottle_requests"]:
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.request_bottle(
+                            actor,
+                            body.get("instrument_id"),
+                            body.get("assay_id"),
+                            body.get("claim_no"),
+                        ),
+                    )
+                if parts == ["api", "expired_bottles", "sweep"]:
+                    body = self._body()
+                    return self._send(200, service.sweep_expired_bottles(actor, as_of=body.get("as_of")))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)

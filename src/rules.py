@@ -1,4 +1,59 @@
+from datetime import date, datetime, timedelta, timezone
+
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+
+
+def _parse_iso(value):
+    """Parse a date or ISO-8601 timestamp; naive values are treated as UTC."""
+    text = str(value).strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        try:
+            parsed = datetime.combine(date.fromisoformat(text), datetime.min.time())
+        except ValueError:
+            raise ValidationError("unparsable date/time value: %s" % value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def bottle_expires_at(lot_expires_at, opened_at, open_vial_days=None, expires_at=None):
+    """Resolve a working bottle expiry instant.
+
+    An explicit ``expires_at`` wins after validation; otherwise the open-vial
+    stability window (default seven days) applies, capped by the lot expiry.
+    Date-only input yields date-only output; any timestamp input yields an
+    ISO-8601 instant with a trailing ``Z``.
+    """
+    opened_text = str(opened_at).strip()
+    opened = _parse_iso(opened_text)
+    lot_expires = _parse_iso(lot_expires_at)
+    explicit_time = "T" in opened_text.upper() or " " in opened_text
+    if expires_at:
+        expiry_text = str(expires_at).strip()
+        expiry = _parse_iso(expiry_text)
+        explicit_time = explicit_time or "T" in expiry_text.upper() or " " in expiry_text
+    else:
+        try:
+            days = int(open_vial_days) if open_vial_days is not None else 7
+        except (TypeError, ValueError):
+            raise ValidationError("open_vial_days must be an integer")
+        if days <= 0:
+            raise ValidationError("open_vial_days must be positive")
+        expiry = opened + timedelta(days=days)
+    if expiry <= opened:
+        raise ValidationError("bottle expiry must be later than opening date")
+    if expiry > lot_expires:
+        expiry = lot_expires
+    if expiry <= opened:
+        raise ValidationError("lot expires before or at bottle opening")
+    if explicit_time:
+        return expiry.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return expiry.date().isoformat()
+
 
 
 def _find_one(lookup, kind, field, value):
@@ -88,7 +143,51 @@ def _validate_qc_lot(actor, data, lookup):
     duplicate = _find_one(lookup, "qc_lot", "lot_key", "%s:%s" % (data["assay_id"], data["lot_no"]))
     if duplicate:
         raise ConflictError("qc lot already exists for assay")
-    return {"lot_key": "%s:%s" % (data["assay_id"], data["lot_no"]), "target": target, "sd": sd}
+    total = data.get("total_bottles")
+    total_bottles = None
+    if total is not None:
+        try:
+            total_bottles = int(total)
+        except (TypeError, ValueError):
+            raise ValidationError("total_bottles must be an integer")
+        if total_bottles <= 0:
+            raise ValidationError("total_bottles must be positive")
+    open_days = data.get("open_vial_days")
+    if open_days is not None:
+        try:
+            open_days = int(open_days)
+        except (TypeError, ValueError):
+            raise ValidationError("open_vial_days must be an integer")
+        if open_days <= 0:
+            raise ValidationError("open_vial_days must be positive")
+    else:
+        open_days = 7
+    _parse_iso(data.get("expires_at"))
+    return {
+        "lot_key": "%s:%s" % (data["assay_id"], data["lot_no"]),
+        "target": target,
+        "sd": sd,
+        "total_bottles": total_bottles,
+        "open_vial_days": open_days,
+    }
+
+
+def _validate_instrument_assay(actor, data, lookup):
+    instrument = _find_one(lookup, "instrument", "id", data.get("instrument_id"))
+    assay = _find_one(lookup, "assay", "id", data.get("assay_id"))
+    if not instrument or not assay:
+        raise ValidationError("instrument and assay are required")
+    scope = "%s:%s" % (data["instrument_id"], data["assay_id"])
+    duplicate = _find_one(lookup, "instrument_assay", "scope", scope)
+    if duplicate:
+        raise ConflictError("instrument/assay binding already exists")
+    try:
+        capacity = int(data.get("bottle_capacity", 1))
+    except (TypeError, ValueError):
+        raise ValidationError("bottle_capacity must be an integer")
+    if capacity <= 0:
+        raise ValidationError("bottle_capacity must be positive")
+    return {"scope": scope, "bottle_capacity": capacity}
 
 
 def _validate_instrument(actor, data, lookup):
@@ -109,7 +208,21 @@ def _validate_qc_run(actor, data, lookup):
         value = float(data.get("value"))
     except (TypeError, ValueError):
         raise ValidationError("qc result value must be numeric")
-    return {"value": value}
+    bottle_id = data.get("working_bottle_id")
+    if bottle_id:
+        bottle = _find_one(lookup, "working_bottle", "id", bottle_id)
+        if not bottle:
+            raise ValidationError("working bottle does not exist")
+        if bottle["data"].get("qc_lot_id") != lot["id"]:
+            raise ValidationError("working bottle does not belong to the qc lot")
+        if bottle["data"].get("assay_id") != assay["id"]:
+            raise ValidationError("working bottle does not belong to the assay")
+        if bottle["status"] not in ("in_stock", "in_use"):
+            raise ValidationError("working bottle is not usable: %s" % bottle["status"])
+        run_at = _parse_iso(data.get("run_at"))
+        if run_at > _parse_iso(bottle["data"].get("expires_at")):
+            raise ValidationError("working bottle had expired at run time")
+    return {"value": value, "working_bottle_id": bottle_id or None}
 
 
 def _validate_result_batch(actor, data, lookup):
@@ -117,7 +230,8 @@ def _validate_result_batch(actor, data, lookup):
         raise ValidationError("assay does not exist")
     if not _find_one(lookup, "instrument", "id", data.get("instrument_id")):
         raise ValidationError("instrument does not exist")
-    if not _find_one(lookup, "qc_run", "id", data.get("qc_run_id")):
+    run = _find_one(lookup, "qc_run", "id", data.get("qc_run_id"))
+    if not run:
         raise ValidationError("qc run does not exist")
     if int(data.get("patient_count", 0)) < 0:
         raise ValidationError("patient_count cannot be negative")
@@ -165,7 +279,23 @@ def _validate_release(actor, entity, data, lookup):
             active_holds.append(batch)
     if active_holds:
         raise ConflictError("an intercepted result batch must be resolved first")
-    return {"released_by": actor.user_id}
+    basis = {
+        "qc_run_id": run["id"],
+        "qc_run_version": run["version"],
+        "qc_run_value": run["data"].get("value"),
+        "qc_run_status": run["status"],
+        "qc_lot_id": run["data"].get("qc_lot_id"),
+        "working_bottle_id": run["data"].get("working_bottle_id"),
+        "bottle_no": None,
+        "bottle_expires_at": None,
+    }
+    bottle_id = run["data"].get("working_bottle_id")
+    if bottle_id:
+        bottle = _find_one(lookup, "working_bottle", "id", bottle_id)
+        if bottle:
+            basis["bottle_no"] = bottle["data"].get("bottle_no")
+            basis["bottle_expires_at"] = bottle["data"].get("expires_at")
+    return {"released_by": actor.user_id, "release_basis": basis}
 
 
 def _validate_qc_retest(actor, entity, data, lookup):
@@ -174,7 +304,12 @@ def _validate_qc_retest(actor, entity, data, lookup):
         raise ValidationError("a replacement run must exist and be accepted")
     if replacement["data"].get("assay_id") != entity["data"].get("assay_id"):
         raise ValidationError("replacement run belongs to another assay")
-    return {"replacement_run_id": replacement["id"]}
+    patch = {"replacement_run_id": replacement["id"]}
+    if entity["kind"] == "result_batch":
+        # the batch is now backed by the replacement QC evidence
+        patch["qc_run_id"] = replacement["id"]
+        patch["previous_qc_run_id"] = entity["data"].get("qc_run_id")
+    return patch
 
 
 def _validate_switch_lot(actor, entity, data, lookup):
@@ -201,6 +336,10 @@ class RuleEngine:
         "instruments": "instrument",
         "qc_runs": "qc_run",
         "result_batches": "result_batch",
+        "working_bottles": "working_bottle",
+        "bottle_claims": "bottle_claim",
+        "dispense_orders": "dispense_order",
+        "instrument_assays": "instrument_assay",
     }
     INITIAL_STATUS = {
         "assay": "active",
@@ -208,6 +347,10 @@ class RuleEngine:
         "instrument": "ready",
         "qc_run": "pending",
         "result_batch": "waiting",
+        "working_bottle": "in_stock",
+        "bottle_claim": "queued",
+        "dispense_order": "recorded",
+        "instrument_assay": "active",
     }
     TRANSITIONS = {
         "assay": {
@@ -228,10 +371,10 @@ class RuleEngine:
         },
         "qc_run": {
             "evaluate": (("pending",), "pending"),
-            "retest": (("rejected",), "retesting"),
+            "retest": (("rejected", "redo_required"), "retesting"),
             "investigate": (("rejected",), "investigated"),
             "resolve": (("investigated", "retesting"), "resolved"),
-            "correct": (("accepted", "rejected", "investigated", "resolved"), "pending"),
+            "correct": (("accepted", "rejected", "investigated", "resolved", "redo_required"), "pending"),
         },
         "result_batch": {
             "release": (("waiting",), "released"),
@@ -248,6 +391,7 @@ class RuleEngine:
         "instrument": ("name", "serial", "calibration_due"),
         "qc_run": ("assay_id", "qc_lot_id", "instrument_id", "value", "run_at"),
         "result_batch": ("assay_id", "instrument_id", "qc_run_id", "run_at", "patient_count"),
+        "instrument_assay": ("instrument_id", "assay_id"),
     }
     ACTION_REQUIRED = {
         ("assay", "suspend"): ("reason",),
@@ -275,6 +419,7 @@ class RuleEngine:
         "instrument": ("supervisor", "admin"),
         "qc_run": ("operator", "supervisor", "admin"),
         "result_batch": ("operator", "supervisor", "admin"),
+        "instrument_assay": ("supervisor", "admin"),
     }
     ROLE_ACTIONS = {
         "suspend": ("supervisor", "admin"),
@@ -299,11 +444,13 @@ class RuleEngine:
         "instrument": _validate_instrument,
         "qc_run": _validate_qc_run,
         "result_batch": _validate_result_batch,
+        "instrument_assay": _validate_instrument_assay,
     }
     CUSTOM_TRANSITIONS = {
         ("qc_run", "evaluate"): _validate_evaluate,
         ("result_batch", "release"): _validate_release,
         ("result_batch", "retest"): _validate_qc_retest,
+        ("qc_run", "retest"): _validate_qc_retest,
         ("qc_lot", "switch_in"): _validate_switch_lot,
         ("qc_run", "correct"): _validate_correct,
         ("result_batch", "correct"): _validate_correct,
@@ -330,10 +477,20 @@ class RuleEngine:
             if value is None or value == "" or value == [] or value == {}:
                 raise ValidationError("missing required field: " + field)
 
+    WORKFLOW_ONLY_KINDS = (
+        "working_bottle",
+        "bottle_claim",
+        "dispense_order",
+    )
+
     def validate_create(self, actor, kind, data, lookup=None):
         kind = self.normalize_kind(kind)
         if kind not in self.INITIAL_STATUS:
             raise ValidationError("unknown kind: " + str(kind))
+        if kind in self.WORKFLOW_ONLY_KINDS:
+            raise ValidationError(
+                "%s is created by the bottle workflow, not by direct creation" % kind
+            )
         self._ensure_role(actor, self.CREATE_ROLES.get(kind, ("admin",)))
         self._require(data, self.CREATE_REQUIRED.get(kind, ()))
         custom = self.CUSTOM_CREATE.get(kind)
