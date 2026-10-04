@@ -84,6 +84,9 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if len(parts) == 4 and parts[0] == "api" and parts[1] == "qc_lots" and parts[3] == "bottles":
+                    bottles = service.repository.find_bottles_by_lot(parts[2])
+                    return self._send(200, {"items": bottles})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -103,6 +106,19 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                # Custom bottle operation endpoints
+                if len(parts) == 4 and parts[0] == "api" and parts[1] == "qc_lots" and parts[3] == "aliquot":
+                    body = self._body()
+                    return self._send(200, service.aliquot_lot(actor, parts[2], body))
+                if len(parts) == 4 and parts[0] == "api" and parts[1] == "working_bottles" and parts[3] == "claim":
+                    body = self._body()
+                    return self._send(200, service.claim_bottle(actor, parts[2], body))
+                if len(parts) == 4 and parts[0] == "api" and parts[1] == "working_bottles" and parts[3] == "release":
+                    return self._send(200, service.release_bottle(actor, parts[2]))
+                if len(parts) == 4 and parts[0] == "api" and parts[1] == "working_bottles" and parts[3] == "expire":
+                    return self._send(200, service.expire_bottle(actor, parts[2]))
+                if len(parts) == 3 and parts[0] == "api" and parts[1] == "working_bottles" and parts[2] == "expire_all":
+                    return self._send(200, service.check_expirations(actor))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)

@@ -88,13 +88,34 @@ def _validate_qc_lot(actor, data, lookup):
     duplicate = _find_one(lookup, "qc_lot", "lot_key", "%s:%s" % (data["assay_id"], data["lot_no"]))
     if duplicate:
         raise ConflictError("qc lot already exists for assay")
-    return {"lot_key": "%s:%s" % (data["assay_id"], data["lot_no"]), "target": target, "sd": sd}
+    try:
+        total_bottles = int(data.get("total_bottles", 0))
+    except (TypeError, ValueError):
+        raise ValidationError("total_bottles must be an integer")
+    if total_bottles < 0:
+        raise ValidationError("total_bottles cannot be negative")
+    return {
+        "lot_key": "%s:%s" % (data["assay_id"], data["lot_no"]),
+        "target": target,
+        "sd": sd,
+        "total_bottles": total_bottles,
+        "aliquoted_count": 0,
+    }
 
 
 def _validate_instrument(actor, data, lookup):
     if not str(data.get("serial", "")).strip():
         raise ValidationError("instrument serial is required")
-    return {"calibration_due": data.get("calibration_due")}
+    try:
+        bottle_capacity = int(data.get("bottle_capacity", 1))
+    except (TypeError, ValueError):
+        raise ValidationError("bottle_capacity must be an integer")
+    if bottle_capacity < 1:
+        raise ValidationError("bottle_capacity must be at least 1")
+    return {
+        "calibration_due": data.get("calibration_due"),
+        "bottle_capacity": bottle_capacity,
+    }
 
 
 def _validate_qc_run(actor, data, lookup):
@@ -105,11 +126,23 @@ def _validate_qc_run(actor, data, lookup):
         raise ValidationError("assay, qc lot and instrument are required")
     if lot["data"].get("assay_id") != assay["id"]:
         raise ValidationError("qc lot does not belong to the assay")
+    bottle_id = data.get("bottle_id")
+    if bottle_id:
+        bottle = _find_one(lookup, "working_bottle", "id", bottle_id)
+        if not bottle:
+            raise ValidationError("working bottle does not exist")
+        if bottle["data"].get("qc_lot_id") != lot["id"]:
+            raise ValidationError("working bottle does not belong to the qc lot")
+        if bottle["data"].get("assay_id") != assay["id"]:
+            raise ValidationError("working bottle does not belong to the assay")
     try:
         value = float(data.get("value"))
     except (TypeError, ValueError):
         raise ValidationError("qc result value must be numeric")
-    return {"value": value}
+    result = {"value": value}
+    if bottle_id:
+        result["bottle_id"] = bottle_id
+    return result
 
 
 def _validate_result_batch(actor, data, lookup):
@@ -194,6 +227,26 @@ def _validate_correct(actor, entity, data, lookup):
     return {"correction_history": history}
 
 
+def _validate_aliquot(actor, entity, data, lookup):
+    count = data.get("count")
+    try:
+        count = int(count)
+    except (TypeError, ValueError):
+        raise ValidationError("count must be an integer")
+    if count < 1:
+        raise ValidationError("count must be at least 1")
+    total = int(entity["data"].get("total_bottles", 0) or 0)
+    if count > total:
+        raise ValidationError(
+            "cannot aliquot %d bottles: total is %d" % (count, total)
+        )
+    return {
+        "count": count,
+        "opened_at": data.get("opened_at"),
+        "expires_at": data.get("expires_at"),
+    }
+
+
 class RuleEngine:
     ALIASES = {
         "assays": "assay",
@@ -201,6 +254,8 @@ class RuleEngine:
         "instruments": "instrument",
         "qc_runs": "qc_run",
         "result_batches": "result_batch",
+        "working_bottles": "working_bottle",
+        "bottles": "working_bottle",
     }
     INITIAL_STATUS = {
         "assay": "active",
@@ -208,6 +263,7 @@ class RuleEngine:
         "instrument": "ready",
         "qc_run": "pending",
         "result_batch": "waiting",
+        "working_bottle": "in_storage",
     }
     TRANSITIONS = {
         "assay": {
@@ -219,6 +275,7 @@ class RuleEngine:
             "switch_in": (("registered",), "active"),
             "suspend": (("active",), "suspended"),
             "retire": (("active", "suspended"), "retired"),
+            "aliquot": (("registered", "active"), "active"),
         },
         "instrument": {
             "calibrate": (("ready", "maintenance", "failed"), "ready"),
@@ -254,6 +311,7 @@ class RuleEngine:
         ("qc_lot", "switch_in"): ("previous_lot_id", "switched_at"),
         ("qc_lot", "suspend"): ("reason",),
         ("qc_lot", "retire"): ("reason",),
+        ("qc_lot", "aliquot"): ("count", "opened_at", "expires_at"),
         ("instrument", "calibrate"): ("calibration_due", "certificate_id"),
         ("instrument", "fail"): ("reason",),
         ("instrument", "maintain"): ("reason",),
@@ -275,6 +333,7 @@ class RuleEngine:
         "instrument": ("supervisor", "admin"),
         "qc_run": ("operator", "supervisor", "admin"),
         "result_batch": ("operator", "supervisor", "admin"),
+        "working_bottle": ("operator", "supervisor", "admin"),
     }
     ROLE_ACTIONS = {
         "suspend": ("supervisor", "admin"),
@@ -282,6 +341,7 @@ class RuleEngine:
         "activate": ("supervisor", "admin"),
         "switch_in": ("supervisor", "admin"),
         "retire": ("supervisor", "admin"),
+        "aliquot": ("operator", "supervisor", "admin"),
         "calibrate": ("supervisor", "admin"),
         "fail": ("operator", "supervisor", "admin"),
         "maintain": ("operator", "supervisor", "admin"),
@@ -307,6 +367,7 @@ class RuleEngine:
         ("qc_lot", "switch_in"): _validate_switch_lot,
         ("qc_run", "correct"): _validate_correct,
         ("result_batch", "correct"): _validate_correct,
+        ("qc_lot", "aliquot"): _validate_aliquot,
     }
 
     def normalize_kind(self, kind):
